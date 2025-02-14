@@ -2,10 +2,9 @@
 galaxy_info:
   license: MIT
   min_ansible_version: "2.10"
-  role_name: aws_linux_storage
+  role_name: azure_linux_storage
   author: Lyas Spiehler
-  description: Ansible role for provisioning storage on Linux AWS EC2 instances
+  description: Ansible role for provisioning storage on Linux Azure VMs
   company: Sapphire Health
 # collections: []
 # dependencies: []
-...
