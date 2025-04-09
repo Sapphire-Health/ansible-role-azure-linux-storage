@@ -28,11 +28,55 @@
       ansible.builtin.debug:
         msg: "{{ managed_disks.results[0].ansible_info }}"
       delegate_to: localhost
+    # workaround for nvme because of https://github.com/Azure/WALinuxAgent/issues/2885
+    - name: Find all volumes in /dev/disk/by-path
+      ansible.builtin.find:
+        paths: /dev/disk/by-path
+        file_type: link
+        patterns: '^(.*?)(-nvme-|-lun-)\d+$'
+        use_regex: yes
+      register: vollinks
+      become: true
+    - name: Show paths
+      ansible.builtin.debug:
+        msg: "{{ vollinks }}"
+    - name: Stat vollinks
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+      loop: "{{ vollinks.files }}"
+      register: vollinkstat
+    - name: Create LUN to path mapping for NVMe
+      ansible.builtin.set_fact:
+        lun_to_path: "{{ lun_to_path | default({}) | combine({'lun' + lun | string: item.stat.path}) }}"
+      loop: "{{ vollinkstat.results }}"
+      vars:
+        device_name: "{{ item.stat.lnk_source | split('/') | last }}"
+        lun: "{{ (item.stat.path | split('-') | last | int) - 2 }}"
+      when: "'nvme' in device_name"
+    - name: Create LUN to path mapping for non-NVMe
+      ansible.builtin.set_fact:
+        lun_to_path: "{{ lun_to_path | default({}) | combine({'lun' + lun | string: item.stat.path}) }}"
+      loop: "{{ vollinkstat.results }}"
+      vars:
+        device_name: "{{ item.stat.lnk_source | split('/') | last }}"
+        lun: "{{ item.stat.path | split('-') | last }}"
+      when: "'sd' in device_name"
+    - name: Show LUN to path mapping
+      ansible.builtin.debug:
+        msg: "{{ lun_to_path }}"
+    # - name: Get volume name to path mapping
+    #   ansible.builtin.set_fact:
+    #     vol_name_to_path: "{{ vol_name_to_path | default({}) | combine({disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label: volpath}) }}"
+    #   vars:
+    #     volpath: "/dev/disk/azure/scsi1/lun{{ disk_mapping.disk.lun }}"
+    #   delegate_to: localhost
+    #   when: disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label is defined
+    #   loop: "{{ managed_disks.results }}"
+    #   loop_control:
+    #     loop_var: disk_mapping
     - name: Get volume name to path mapping
       ansible.builtin.set_fact:
-        vol_name_to_path: "{{ vol_name_to_path | default({}) | combine({disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label: volpath}) }}"
-      vars:
-        volpath: "/dev/disk/azure/scsi1/lun{{ disk_mapping.disk.lun }}"
+        vol_name_to_path: "{{ vol_name_to_path | default({}) | combine({disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label: lun_to_path['lun' + disk_mapping.disk.lun | string]}) }}"
       delegate_to: localhost
       when: disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label is defined
       loop: "{{ managed_disks.results }}"
