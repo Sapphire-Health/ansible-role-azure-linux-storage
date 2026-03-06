@@ -26,6 +26,7 @@
       azure.azcollection.azure_rm_manageddisk_info:
         name: "{{ disk.name }}"
         resource_group: "{{ hostvars[inventory_hostname]['resource_group'] }}"
+        subscription_id: "{{ hostvars[inventory_hostname]['os_disk']['id'].split('/')[2] }}"
         auth_source: msi
       register: azure_linux_storage_managed_disks
       delegate_to: localhost
