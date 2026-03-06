@@ -1,0 +1,142 @@
+- name: Add tags to all tasks
+  tags:
+    - always
+  block:
+    - name: Stat /dev/disk/azure directory
+      ansible.builtin.stat:
+        path: /dev/disk/azure
+      register: azure_linux_storage_azurediskdir
+    # workaround for nvme because of https://github.com/Azure/WALinuxAgent/issues/2885
+
+    - name: Get mappings for NVME disks
+      when: not azure_linux_storage_azurediskdir.stat.exists
+      block:
+        - name: Find all volumes in /dev/disk/by-path
+          ansible.builtin.find:
+            paths: /dev/disk/by-path
+            file_type: link
+            patterns: '^(.*?)(-nvme-|-lun-)\d+$'
+            use_regex: true
+          register: azure_linux_storage_vollinks
+          become: true
+
+        - name: Show paths
+          ansible.builtin.debug:
+            msg: "{{ azure_linux_storage_vollinks }}"
+
+        - name: Stat vollinks
+          ansible.builtin.stat:
+            path: "{{ item.path }}"
+          loop: "{{ azure_linux_storage_vollinks.files }}"
+          register: azure_linux_storage_vollinkstat
+
+        - name: Create LUN to path mapping for NVMe
+          ansible.builtin.set_fact:
+            azure_linux_storage_lun_to_path: "{{ azure_linux_storage_lun_to_path | default({}) | combine({'lun' + lun | string: item.stat.path}) }}"
+          loop: "{{ azure_linux_storage_vollinkstat.results }}"
+          vars:
+            device_name: "{{ item.stat.lnk_source | split('/') | last }}"
+            lun: "{{ (item.stat.path | split('-') | last | int) - 2 }}"
+          when: "'nvme' in device_name"
+
+        - name: Create LUN to path mapping for non-NVMe
+          ansible.builtin.set_fact:
+            azure_linux_storage_lun_to_path: "{{ azure_linux_storage_lun_to_path | default({}) | combine({'lun' + lun | string: item.stat.path}) }}"
+          loop: "{{ azure_linux_storage_vollinkstat.results }}"
+          vars:
+            device_name: "{{ item.stat.lnk_source | split('/') | last }}"
+            lun: "{{ item.stat.path | split('-') | last }}"
+          when: "'sd' in device_name"
+
+        - name: Show LUN to path mapping
+          ansible.builtin.debug:
+            msg: "{{ azure_linux_storage_lun_to_path }}"
+
+        - name: Get volume name to path mapping
+          ansible.builtin.set_fact:
+            azure_linux_storage_vol_name_to_path: "{{ azure_linux_storage_vol_name_to_path | default({}) | combine({disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label: azure_linux_storage_lun_to_path['lun' + disk_mapping.disk.lun | string]}) }}"
+          delegate_to: localhost
+          when: disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label is defined
+          loop: "{{ azure_linux_storage_managed_disks.results }}"
+          loop_control:
+            loop_var: disk_mapping
+
+    - name: Get mappings for non-NVME disks
+      when: azure_linux_storage_azurediskdir.stat.exists
+      block:
+        - name: Get volume name to path mapping
+          ansible.builtin.set_fact:
+            azure_linux_storage_vol_name_to_path: "{{ azure_linux_storage_vol_name_to_path | default({}) | combine({disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label: volpath}) }}"
+          vars:
+            volpath: "/dev/disk/azure/scsi1/lun{{ disk_mapping.disk.lun }}"
+          delegate_to: localhost
+          when: disk_mapping.ansible_info.azure_managed_disk[0].tags.disk_label is defined
+          loop: "{{ azure_linux_storage_managed_disks.results }}"
+          loop_control:
+            loop_var: disk_mapping
+
+    - name: Show volume name to path mapping
+      ansible.builtin.debug:
+        msg: "{{ azure_linux_storage_vol_name_to_path }}"
+      delegate_to: localhost
+
+    - name: Check disk paths
+      ansible.builtin.stat:
+        path: "{{ item.value }}"
+      loop: "{{ azure_linux_storage_vol_name_to_path | dict2items }}"
+      register: azure_linux_storage_disk_paths
+
+    - name: Make sure all paths exist and are symlinks
+      ansible.builtin.fail:
+        msg: "{{ path.stat.islnk }} is not a symlink"
+      when: not path.stat.islnk
+      loop: "{{ azure_linux_storage_disk_paths.results }}"
+      loop_control:
+        loop_var: path
+
+    - name: Get storage pools to path list mapping
+      changed_when: false
+      ansible.utils.update_fact:
+        updates:
+          - path: "storage_layout[{{ storage_pool_index }}].disks"
+            value: >-
+              {%- set disks = [] -%}
+                {%- for disk in storage_pool.disks -%}
+                {%- set disks = disks.append(azure_linux_storage_vol_name_to_path[disk]) -%}
+              {%- endfor -%}
+              {{ disks }}
+      delegate_to: localhost
+      loop: "{{ storage_layout }}"
+      loop_control:
+        loop_var: storage_pool
+        index_var: storage_pool_index
+      register: azure_linux_storage_updated
+
+    # - name: Show storage layout
+    #   ansible.builtin.debug:
+    #     msg: "{{ azure_linux_storage_updated.results[-1].storage_layout }}"
+    #   delegate_to: localhost
+
+    - name: Set storage pools to match modified storage layout from vars
+      ansible.builtin.set_fact:
+        storage_pools: "{{ azure_linux_storage_updated.results[-1].storage_layout }}"
+      delegate_to: localhost
+
+    - name: Show storage layout
+      ansible.builtin.debug:
+        msg: "{{ storage_pools }}"
+      delegate_to: localhost
+
+    - name: Provision Storage
+      become: true
+      block:
+        - name: Install dependencies
+          ansible.builtin.dnf:
+            name: "{{ item }}"
+            state: present
+          loop:
+            - lvm2
+
+        - name: Provision storage
+          ansible.builtin.include_role:
+            name: linux-system-roles.storage
